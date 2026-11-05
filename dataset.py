@@ -4,10 +4,12 @@ import math
 import parse
 import numpy as np
 import pandas as pd
+from collections import deque
 from PIL import Image
 from tqdm import tqdm
 from torch.utils.data import Dataset, IterableDataset
 from utils.general import get_rally_dirs, get_match_median, HEIGHT, WIDTH, SIGMA, IMG_FORMAT
+from utils.runtime import StageTimer
 
 data_dir = 'data'
 
@@ -163,7 +165,8 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
         img_shape = [] # (num_rally, 2)
 
         for rally_i, rally_dir in tqdm(self.rally_dict['i2p'].items()):
-            w, h = Image.open(os.path.join(rally_dir, f'0.{IMG_FORMAT}')).size
+            with Image.open(os.path.join(rally_dir, f'0.{IMG_FORMAT}')) as image:
+                w, h = image.size
             w_scaler, h_scaler = w / self.WIDTH, h / self.HEIGHT
             img_scaler.append((w_scaler, h_scaler))
             img_shape.append((w, h))
@@ -677,7 +680,8 @@ class Video_IterableDataset(IterableDataset):
         WIDTH=WIDTH,
         max_sample_num=1800,
         video_range=None,
-        median=None
+        median=None,
+        timer=None
     ):
         """ Initialize the dataset
             Args:
@@ -696,83 +700,133 @@ class Video_IterableDataset(IterableDataset):
                 video_range (Tuple[int]): Range of start second and end second of the video for generating median image.
                 median (np.ndarray): Median image.
         """
-        # Image size
+        if seq_len < 1 or not 1 <= sliding_step <= seq_len:
+            raise ValueError('Sequence length must be positive and sliding step must be in [1, seq_len]')
+        if not isinstance(max_sample_num, (int, np.integer)) or max_sample_num < 1:
+            raise ValueError('Maximum background sample count must be a positive integer')
+        if bg_mode not in ('', 'subtract', 'subtract_concat', 'concat'):
+            raise ValueError(f'Invalid background mode: {bg_mode}')
         self.HEIGHT = HEIGHT
         self.WIDTH = WIDTH
-
         self.video_file = video_file
-        self.cap = cv2.VideoCapture(self.video_file)
-        self.video_len = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
-        self.w, self.h = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.timer = timer if timer is not None else StageTimer()
+        cap = cv2.VideoCapture(video_file)
+        try:
+            if not cap.isOpened():
+                raise ValueError(f'Cannot open video: {video_file}')
+            self.video_len = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            self.fps = float(cap.get(cv2.CAP_PROP_FPS))
+            self.w, self.h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        finally:
+            cap.release()
         self.w_scaler, self.h_scaler = self.w / self.WIDTH, self.h / self.HEIGHT
-
-
         self.seq_len = seq_len
         self.sliding_step = sliding_step
         self.bg_mode = bg_mode
+        self.stats = {
+            'decoded_frames': 0, 'preprocessed_frames': 0,
+            'peak_cached_frames': 0, 'peak_cache_bytes': 0,
+            'cached_dtype': 'float32',
+            'background': {
+                'method': 'none' if not bg_mode else 'provided',
+                'max_sample_num': max_sample_num, 'video_range_seconds': video_range,
+                'sample_indices': [], 'sample_buffer_bytes': 0,
+            },
+        }
         if self.bg_mode:
             self.median = median if median is not None else self.__gen_median__(max_sample_num, video_range)
+            self.stats['background']['median_bytes'] = 0 if self.median is None else self.median.nbytes
+            self._median_channels = (self.median.astype(np.float32) / np.float32(255)
+                                     if bg_mode == 'concat' and self.median is not None else None)
+            self.stats['background']['normalized_median_bytes'] = (
+                0 if self._median_channels is None else self._median_channels.nbytes)
 
     def __iter__(self):
-        """ Return the data squentially. """
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        success = True
-        start_f_id, end_f_id = 0, 0
-        frame_list = []
-        while success:
-            # Sample frames
-            while len(frame_list) < self.seq_len:
-                success, frame = self.cap.read()
-                if not success:
+        """Decode and preprocess each real frame once, retaining at most one window."""
+        self.stats.update(decoded_frames=0, preprocessed_frames=0, peak_cached_frames=0, peak_cache_bytes=0)
+        cap = cv2.VideoCapture(self.video_file)
+        cache = deque()
+        eof, emitted, frame_id = False, False, 0
+        try:
+            if not cap.isOpened():
+                raise ValueError(f'Cannot open video: {self.video_file}')
+            while True:
+                while len(cache) < self.seq_len and not eof:
+                    with self.timer.measure('decode'):
+                        success, frame = cap.read()
+                    if not success:
+                        eof = True
+                        break
+                    if self.w <= 0 or self.h <= 0:
+                        raise ValueError('Nonempty video has invalid image dimensions')
+                    with self.timer.measure('preprocess'):
+                        processed = self._process_frame(frame[..., ::-1])
+                    cache.append((frame_id, processed))
+                    frame_id += 1
+                    self.stats['decoded_frames'] += 1
+                    self.stats['preprocessed_frames'] += 1
+                    self.timer.count('decoded_frames')
+                    self.timer.count('preprocessed_frames')
+                if not cache or (len(cache) < self.seq_len and self.sliding_step < self.seq_len and emitted):
                     break
-                frame_list.append(frame)
-                end_f_id += 1
-
-            # Form a sequence
-            data_idx = [(0, i) for i in range(start_f_id, end_f_id)]
-            if len(data_idx) < self.seq_len:
-                # Padding the last sequence if imcompleted
-                data_idx.extend([(0, end_f_id-1)]*(self.seq_len - len(data_idx)))
-                frame_list.extend([frame_list[-1]]*(self.seq_len - len(frame_list)))
-            data_idx = np.array(data_idx)
-            frames = self.__process__(np.array(frame_list)[..., ::-1])
-            yield data_idx, frames
-
-            # Update the sliding window
-            frame_list = frame_list[self.sliding_step:]
-            start_f_id = start_f_id + self.sliding_step
-
-        self.cap.release()
+                self.stats['peak_cached_frames'] = max(self.stats['peak_cached_frames'], len(cache))
+                self.stats['peak_cache_bytes'] = max(self.stats['peak_cache_bytes'], sum(frame.nbytes for _, frame in cache))
+                self.timer.maximum('peak_cached_frames', self.stats['peak_cached_frames'])
+                self.timer.maximum('peak_cache_bytes', self.stats['peak_cache_bytes'])
+                window = list(cache)
+                window.extend([window[-1]] * (self.seq_len - len(window)))
+                indices = np.array([(0, index) for index, _ in window], dtype=np.int64)
+                with self.timer.measure('preprocess'):
+                    channels = [frame for _, frame in window]
+                    if self.bg_mode == 'concat':
+                        channels.insert(0, self._median_channels)
+                    frames = np.concatenate(channels, axis=0)
+                yield indices, frames
+                emitted = True
+                for _ in range(min(self.sliding_step, len(cache))):
+                    cache.popleft()
+                if eof:
+                    break
+        finally:
+            cap.release()
 
     def __gen_median__(self, max_sample_num, video_range):
-        """ Generate the median image.
-
-            Args:
-                max_sample_num (int): Maximum number of frames to sample for generating median image.
-                video_range (Tuple[int]): Range of start second and end second of the video for generating median image.
-        """
+        """Exact original-resolution median with a hard, deterministic sample limit."""
         print('Generate median image...')
         if video_range is None:
             start_frame, end_frame = 0, self.video_len
         else:
-            start_frame = max(0, video_range[0] * self.fps)
-            end_frame = min(video_range[1] * self.fps, self.video_len)
+            if (len(video_range) != 2 or not all(math.isfinite(value) for value in video_range)
+                    or video_range[0] < 0 or video_range[1] <= video_range[0]
+                    or not math.isfinite(self.fps) or self.fps <= 0):
+                raise ValueError('Background range must be [start,end) seconds with 0 <= start < end and valid FPS')
+            start_frame = max(0, math.ceil(video_range[0] * self.fps))
+            end_frame = min(math.ceil(video_range[1] * self.fps), self.video_len)
         video_seg_len = end_frame - start_frame
-
-        if video_seg_len > max_sample_num:
-            sample_step = video_seg_len // max_sample_num
-        else:
-            sample_step = 1
-        
-        frame_list = []
-        for i in range(start_frame, end_frame, sample_step):
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            success, frame = self.cap.read()
-            if not success:
-                break
-            frame_list.append(frame)
-        median = np.median(frame_list, 0)[..., ::-1] # BGR to RGB
+        if video_seg_len <= 0:
+            if self.video_len == 0:
+                self.stats['background']['method'] = 'empty_video'
+                return None
+            raise ValueError('Background sampling range contains no video frames')
+        sample_step = max(1, math.ceil(video_seg_len / max_sample_num))
+        indices = list(range(start_frame, end_frame, sample_step))
+        samples = np.empty((len(indices), self.h, self.w, 3), dtype=np.uint8)
+        self.stats['background'].update(method='ceil_stride_exact_original_resolution_median',
+                                        sample_indices=indices, sample_buffer_bytes=samples.nbytes)
+        cap = cv2.VideoCapture(self.video_file)
+        try:
+            for n, index in enumerate(indices):
+                with self.timer.measure('background_decode'):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+                    success, frame = cap.read()
+                if not success:
+                    raise ValueError(f'Cannot decode background sample frame {index}: {self.video_file}')
+                samples[n] = frame
+                self.timer.count('background_sample_frames')
+        finally:
+            cap.release()
+        with self.timer.measure('background_median'):
+            median = np.median(samples, axis=0, overwrite_input=True)[..., ::-1]
         if self.bg_mode == 'concat':
             median = Image.fromarray(median.astype('uint8'))
             median = np.array(median.resize(size=(self.WIDTH, self.HEIGHT)))
@@ -781,34 +835,22 @@ class Video_IterableDataset(IterableDataset):
         return median
     
     def __process__(self, imgs):
-        """ Process the frame sequence. """
-        if self.bg_mode:
-            median_img = self.median
-        frames = np.array([]).reshape(0, self.HEIGHT, self.WIDTH)
-        for i in range(self.seq_len):
-            img = Image.fromarray(imgs[i])
-            if self.bg_mode == 'subtract':
-                img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                img = img.reshape(1, self.HEIGHT, self.WIDTH)
-            elif self.bg_mode == 'subtract_concat':
-                diff_img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                diff_img = np.array(diff_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                diff_img = diff_img.reshape(1, self.HEIGHT, self.WIDTH)
-                img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                img = np.moveaxis(img, -1, 0)
-                img = np.concatenate((img, diff_img), axis=0)
-            else:
-                img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                img = np.moveaxis(img, -1, 0)
-            
-            frames = np.concatenate((frames, img), axis=0)
-        
+        frames = [self._process_frame(image) for image in imgs]
         if self.bg_mode == 'concat':
-            frames = np.concatenate((median_img, frames), axis=0)
-        
-        # Normalization
-        frames /= 255.
-        return frames
+            frames.insert(0, self._median_channels)
+        return np.concatenate(frames, axis=0)
 
-        
+    def _process_frame(self, rgb):
+        if self.bg_mode and self.median is None:
+            raise ValueError('Cannot preprocess a nonempty video without a background median')
+        if self.bg_mode in ('subtract', 'subtract_concat'):
+            difference = np.sum(np.absolute(rgb - self.median), axis=2).astype(np.uint8)
+            difference = np.asarray(Image.fromarray(difference).resize((self.WIDTH, self.HEIGHT)))[None]
+        if self.bg_mode == 'subtract':
+            channels = difference
+        else:
+            image = np.asarray(Image.fromarray(rgb).resize((self.WIDTH, self.HEIGHT)))
+            channels = np.moveaxis(image, -1, 0)
+            if self.bg_mode == 'subtract_concat':
+                channels = np.concatenate((channels, difference), axis=0)
+        return channels.astype(np.float32) / np.float32(255)
