@@ -6,9 +6,19 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from test import predict_location, get_ensemble_weight, generate_inpaint_mask
+from test import predict_location, evaluate_prediction_dict
 from dataset import Shuttlecock_Trajectory_Dataset, Video_IterableDataset
 from utils.general import *
+from utils.metric import metrics_from_types, validate_heatmap_threshold
+from utils.runtime import (
+    StageTimer, evaluation_protocol, file_identity, load_checkpoint,
+    video_result, write_run_report,
+)
+from utils.temporal import iter_heatmap_predictions
+from utils.inpaint import (
+    format_inpaint_predictions, generate_inpaint_mask,
+    get_ensemble_weight, inpaint_trajectory,
+)
 
 # -----------------------------------------------------------------------------
 # PyTorch inference device
@@ -28,7 +38,7 @@ else:
 print(f"Using PyTorch device: {device}")
 
 
-def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
+def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), heatmap_threshold=0.5):
     """ Predict coordinates from heatmap or inpainted coordinates. 
 
         Args:
@@ -36,6 +46,7 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
             y_pred (torch.Tensor, optional): predicted heatmap sequence with shape (N, L, H, W)
             c_pred (torch.Tensor, optional): predicted inpainted coordinates sequence with shape (N, L, 2)
             img_scaler (Tuple): image scaler (w_scaler, h_scaler)
+            heatmap_threshold (float): finite [0,1] strict heatmap decoding threshold
 
         Returns:
             pred_dict (Dict): dictionary of predicted coordinates
@@ -45,11 +56,11 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
     pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
 
     batch_size, seq_len = indices.shape[0], indices.shape[1]
-    indices = indices.detach().cpu().numpy()if torch.is_tensor(indices) else indices.numpy()
+    indices = indices.detach().cpu().numpy() if torch.is_tensor(indices) else np.asarray(indices)
     
     # Transform input for heatmap prediction
     if y_pred is not None:
-        y_pred = y_pred > 0.5
+        y_pred = y_pred > validate_heatmap_threshold(heatmap_threshold)
         y_pred = y_pred.detach().cpu().numpy() if torch.is_tensor(y_pred) else y_pred
         y_pred = to_img_format(y_pred) # (N, L, H, W)
     
@@ -85,24 +96,125 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
     
     return pred_dict    
 
+
+def predict_video(tracknet, video_file, settings, inpaintnet=None, timer=None, inference_device=None):
+    timer = timer if timer is not None else StageTimer()
+    inference_device = device if inference_device is None else inference_device
+    seq_len, bg_mode = settings['tracknet_seq_len'], settings['bg_mode']
+    nonoverlap = settings['eval_mode'] == 'nonoverlap'
+    with timer.measure('input_setup'):
+        if settings['large_video']:
+            dataset = Video_IterableDataset(
+                video_file, seq_len=seq_len, sliding_step=seq_len if nonoverlap else 1,
+                bg_mode=bg_mode, max_sample_num=settings['max_sample_num'],
+                video_range=settings['video_range'], timer=timer)
+            w, h, fps, declared_frames = dataset.w, dataset.h, dataset.fps, dataset.video_len
+            data_loader = DataLoader(dataset, batch_size=settings['batch_size'], shuffle=False, drop_last=False)
+        else:
+            cap = cv2.VideoCapture(video_file)
+            try:
+                if not cap.isOpened():
+                    raise ValueError(f'Cannot open video: {video_file}')
+                w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps, declared_frames = float(cap.get(cv2.CAP_PROP_FPS)), int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            finally:
+                cap.release()
+            with timer.measure('decode'):
+                frame_list = generate_frames(video_file)
+            timer.count('decoded_frames', len(frame_list))
+            if frame_list:
+                if w <= 0 or h <= 0:
+                    raise ValueError('Nonempty video has invalid image dimensions')
+                step = seq_len if nonoverlap or len(frame_list) < seq_len else 1
+                dataset = Shuttlecock_Trajectory_Dataset(
+                    seq_len=seq_len, sliding_step=step, data_mode='heatmap', bg_mode=bg_mode,
+                    frame_arr=np.asarray(frame_list)[..., ::-1], padding=step == seq_len)
+                data_loader = DataLoader(
+                    dataset, batch_size=settings['batch_size'], shuffle=False,
+                    num_workers=settings['num_workers'], drop_last=False)
+            else:
+                dataset, data_loader = None, []
+    img_scaler = (w / WIDTH, h / HEIGHT)
+    raw = {'Frame': [], 'X': [], 'Y': [], 'Visibility': []}
+    tracknet.eval()
+    for indices, _, heatmaps in iter_heatmap_predictions(
+            tracknet, tqdm(data_loader), settings['eval_mode'], inference_device, timer):
+        with timer.measure('postprocess'):
+            prediction = predict(indices, y_pred=heatmaps, img_scaler=img_scaler,
+                                 heatmap_threshold=settings['heatmap_threshold'])
+            for key, values in prediction.items():
+                raw[key].extend(values)
+    if inpaintnet is not None and raw['Frame']:
+        inpaintnet.eval()
+        with timer.measure('postprocess'):
+            mask = generate_inpaint_mask(raw, th_h=h * 0.05, seq_len=settings['inpaintnet_seq_len'])
+            coordinates = torch.tensor(np.column_stack((raw['X'], raw['Y'])),
+                                       dtype=torch.float32) / torch.tensor((w, h))
+            coordinates[torch.tensor(raw['Visibility']) == 0] = 0.
+            indices = torch.stack((torch.zeros(len(coordinates), dtype=torch.long),
+                                   torch.tensor(raw['Frame'], dtype=torch.long)), dim=1)
+        with timer.measure('inpainting', inference_device):
+            coordinates, repair_mask = inpaint_trajectory(
+                inpaintnet, coordinates, torch.tensor(mask, dtype=torch.float32).reshape(-1, 1),
+                settings['inpaintnet_seq_len'], eval_mode=settings['eval_mode'],
+                batch_size=settings['batch_size'], device=inference_device, indices=indices,
+                coor_th=COOR_TH, timer=timer)
+    else:
+        coordinates = torch.zeros((len(raw['Frame']), 2))
+        repair_mask = torch.zeros((len(coordinates), 1), dtype=torch.bool)
+    with timer.measure('postprocess'):
+        final = format_inpaint_predictions(raw, coordinates, repair_mask, (w, h))
+    metadata = {
+        'path': video_file, 'width': w, 'height': h,
+        'fps': fps if math.isfinite(fps) and fps > 0 else None,
+        'declared_frames': declared_frames, 'processed_frames': len(raw['Frame']),
+        'input_source': 'streamed_video' if settings['large_video'] else 'preloaded_video',
+        'num_workers': data_loader.num_workers if dataset is not None else 0,
+        'heatmap_threshold_applied': settings['heatmap_threshold'],
+    }
+    if settings['large_video']:
+        metadata['streaming'] = dataset.stats
+    else:
+        metadata['background'] = {
+            'method': 'exact_all_frame_median' if bg_mode else 'none',
+            'sample_count': len(raw['Frame']) if bg_mode else 0,
+            'sampling_controls_apply': False,
+        }
+    return raw, final, metadata
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--video_file', type=str, help='file path of the video')
     parser.add_argument('--tracknet_file', type=str, help='file path of the TrackNet model checkpoint')
     parser.add_argument('--inpaintnet_file', type=str, default='', help='file path of the InpaintNet model checkpoint')
     parser.add_argument('--batch_size', type=int, default=16, help='batch size for inference')
+    parser.add_argument('--heatmap_threshold', type=validate_heatmap_threshold, default=0.5,
+                        help='strict heatmap > threshold decoding in [0,1]; not calibrated confidence')
     parser.add_argument('--eval_mode', type=str, default='weight', choices=['nonoverlap', 'average', 'weight'], help='evaluation mode')
-    parser.add_argument('--max_sample_num', type=int, default=1800, help='maximum number of frames to sample for generating median image')
-    parser.add_argument('--video_range', type=lambda splits: [int(s) for s in splits.split(',')], default=None, help='range of start second and end second of the video for generating median image')
+    parser.add_argument('--max_sample_num', type=int, default=1800, help='hard maximum original-resolution background samples for --large_video')
+    parser.add_argument('--video_range', type=lambda splits: [int(s) for s in splits.split(',')], default=None, help='[start,end) seconds for --large_video background sampling')
     parser.add_argument('--save_dir', type=str, default='pred_result', help='directory to save the prediction result')
-    parser.add_argument('--large_video', action='store_true', default=False, help='whether to process large video')
+    parser.add_argument('--large_video', action='store_true', default=False, help='stream cached float32 frame windows; backgrounds and outputs still require additional memory')
     parser.add_argument('--output_video', action='store_true', default=False, help='whether to output video with predicted trajectory')
+    parser.add_argument('--output_provenance', action='store_true', default=False,
+                        help='append raw detection columns and the eligible Inpaint_Mask to the CSV; these are not confidence scores')
+    parser.add_argument('--output_run', action='store_true',
+                        help='write a reproducible run JSON sidecar with synchronized stage timing and observable statistics')
+    parser.add_argument('--label_file', default='', help='optional original-pixel ground-truth CSV for --output_run raw/final comparison')
+    parser.add_argument('--tolerance', type=float, default=4.,
+                        help='labeled comparison distance tolerance in 512x288 input pixels, not original video pixels')
     parser.add_argument('--traj_len', type=int, default=8, help='length of trajectory to draw on video')
     args = parser.parse_args()
+    if args.label_file and not args.output_run:
+        parser.error('--label_file requires --output_run')
+    evaluation_protocol(args.tolerance)
+    timer = StageTimer(args.output_run)
+    models = {}
 
     num_workers = args.batch_size if args.batch_size <= 16 else 16
     video_file = args.video_file
-    video_name = video_file.split('/')[-1][:-4]
+    video_name = os.path.splitext(os.path.basename(video_file))[0]
     video_range = args.video_range if args.video_range else None
     large_video = args.large_video
     out_csv_file = os.path.join(args.save_dir, f'{video_name}_ball.csv')
@@ -114,224 +226,53 @@ if __name__ == '__main__':
     # Load model
     # Load checkpoint tensors onto the selected inference device.
     # This allows CUDA-trained checkpoints to be restored on MPS or CPU systems.
-    tracknet_ckpt = torch.load(
-        args.tracknet_file,
-        map_location=device
-    )
-    tracknet_seq_len = tracknet_ckpt['param_dict']['seq_len']
-    bg_mode = tracknet_ckpt['param_dict']['bg_mode']
-    tracknet = get_model('TrackNet', tracknet_seq_len, bg_mode).to(device)
-    tracknet.load_state_dict(tracknet_ckpt['model'])
+    with timer.measure('model_load', device):
+        tracknet_ckpt, identity = load_checkpoint(args.tracknet_file, args.output_run, device, timer)
+        if args.output_run:
+            models['TrackNet'] = identity
+        tracknet_seq_len = tracknet_ckpt['param_dict']['seq_len']
+        bg_mode = tracknet_ckpt['param_dict']['bg_mode']
+        tracknet = get_model('TrackNet', tracknet_seq_len, bg_mode).to(device)
+        tracknet.load_state_dict(tracknet_ckpt['model'])
 
     if args.inpaintnet_file:
-        inpaintnet_ckpt = torch.load(
-            args.inpaintnet_file,
-            map_location=device
-        )
-        inpaintnet_seq_len = inpaintnet_ckpt['param_dict']['seq_len']
-        inpaintnet = get_model('InpaintNet').to(device)
-        inpaintnet.load_state_dict(inpaintnet_ckpt['model'])
+        with timer.measure('model_load', device):
+            inpaintnet_ckpt, identity = load_checkpoint(args.inpaintnet_file, args.output_run, device, timer)
+            if args.output_run:
+                models['InpaintNet'] = identity
+            inpaintnet_seq_len = inpaintnet_ckpt['param_dict']['seq_len']
+            inpaintnet = get_model('InpaintNet').to(device)
+            inpaintnet.load_state_dict(inpaintnet_ckpt['model'])
     else:
         inpaintnet = None
-
-    cap = cv2.VideoCapture(args.video_file)
-    w, h = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-    w_scaler, h_scaler = w / WIDTH, h / HEIGHT
-    img_scaler = (w_scaler, h_scaler)
-
-    tracknet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Inpaint_Mask':[],
-                        'Img_scaler': (w_scaler, h_scaler), 'Img_shape': (w, h)}
-
-    # Test on TrackNet
-    tracknet.eval()
-    seq_len = tracknet_seq_len
-    if args.eval_mode == 'nonoverlap':
-        # Create dataset with non-overlap sampling
-        if large_video:
-            dataset = Video_IterableDataset(video_file, seq_len=seq_len, sliding_step=seq_len, bg_mode=bg_mode, 
-                                            max_sample_num=args.max_sample_num, video_range=video_range)
-            data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
-            print(f'Video length: {dataset.video_len}')
-        else:
-            # Sample all frames from video
-            frame_list = generate_frames(args.video_file)
-            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='heatmap', bg_mode=bg_mode,
-                                                 frame_arr=np.array(frame_list)[:, :, :, ::-1], padding=True)
-            data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
-
-        for step, (i, x) in enumerate(tqdm(data_loader)):
-            x = x.float().to(device)
-            with torch.no_grad():
-                y_pred = tracknet(x).detach().cpu()
-            
-            # Predict
-            tmp_pred = predict(i, y_pred=y_pred, img_scaler=img_scaler)
-            for key in tmp_pred.keys():
-                tracknet_pred_dict[key].extend(tmp_pred[key])
-    else:
-        # Create dataset with overlap sampling for temporal ensemble
-        if large_video:
-            dataset = Video_IterableDataset(video_file, seq_len=seq_len, sliding_step=1, bg_mode=bg_mode,
-                                            max_sample_num=args.max_sample_num, video_range=video_range)
-            data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
-            video_len = dataset.video_len
-            print(f'Video length: {video_len}')
-            
-        else:
-            # Sample all frames from video
-            frame_list = generate_frames(args.video_file)
-            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='heatmap', bg_mode=bg_mode,
-                                                 frame_arr=np.array(frame_list)[:, :, :, ::-1])
-            data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
-            video_len = len(frame_list)
-        
-        # Init prediction buffer params
-        num_sample, sample_count = video_len-seq_len+1, 0
-        buffer_size = seq_len - 1
-        batch_i = torch.arange(seq_len) # [0, 1, 2, 3, 4, 5, 6, 7]
-        frame_i = torch.arange(seq_len-1, -1, -1) # [7, 6, 5, 4, 3, 2, 1, 0]
-        y_pred_buffer = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
-        weight = get_ensemble_weight(seq_len, args.eval_mode)
-        for step, (i, x) in enumerate(tqdm(data_loader)):
-            x = x.float().to(device)
-            b_size, seq_len = i.shape[0], i.shape[1]
-            with torch.no_grad():
-                y_pred = tracknet(x).detach().cpu()
-            
-            y_pred_buffer = torch.cat((y_pred_buffer, y_pred), dim=0)
-            ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
-            ensemble_y_pred = torch.empty((0, 1, HEIGHT, WIDTH), dtype=torch.float32)
-
-            for b in range(b_size):
-                if sample_count < buffer_size:
-                    # Imcomplete buffer
-                    y_pred = y_pred_buffer[batch_i+b, frame_i].sum(0) / (sample_count+1)
-                else:
-                    # General case
-                    y_pred = (y_pred_buffer[batch_i+b, frame_i] * weight[:, None, None]).sum(0)
-                
-                ensemble_i = torch.cat((ensemble_i, i[b][0].reshape(1, 1, 2)), dim=0)
-                ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                sample_count += 1
-
-                if sample_count == num_sample:
-                    # Last batch
-                    y_zero_pad = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
-                    y_pred_buffer = torch.cat((y_pred_buffer, y_zero_pad), dim=0)
-
-                    for f in range(1, seq_len):
-                        # Last input sequence
-                        y_pred = y_pred_buffer[batch_i+b+f, frame_i].sum(0) / (seq_len-f)
-                        ensemble_i = torch.cat((ensemble_i, i[-1][f].reshape(1, 1, 2)), dim=0)
-                        ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-
-            # Predict
-            tmp_pred = predict(ensemble_i, y_pred=ensemble_y_pred, img_scaler=img_scaler)
-            for key in tmp_pred.keys():
-                tracknet_pred_dict[key].extend(tmp_pred[key])
-
-            # Update buffer, keep last predictions for ensemble in next iteration
-            y_pred_buffer = y_pred_buffer[-buffer_size:]
-
-    #assert video_len == len(tracknet_pred_dict['Frame']), 'Prediction length mismatch'
-    # Test on TrackNetV3 (TrackNet + InpaintNet)
-    if inpaintnet is not None:
-        inpaintnet.eval()
-        seq_len = inpaintnet_seq_len
-        tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(tracknet_pred_dict, th_h=h*0.05)
-        inpaint_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
-
-        if args.eval_mode == 'nonoverlap':
-            # Create dataset with non-overlap sampling
-            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='coordinate', pred_dict=tracknet_pred_dict, padding=True)
-            data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
-
-            for step, (i, coor_pred, inpaint_mask) in enumerate(tqdm(data_loader)):
-                coor_pred, inpaint_mask = coor_pred.float(), inpaint_mask.float()
-                with torch.no_grad():
-                    coor_inpaint = inpaintnet(coor_pred.to(device), inpaint_mask.to(device)).detach().cpu()
-                    coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask) # replace predicted coordinates with inpainted coordinates
-                
-                # Thresholding
-                th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
-                coor_inpaint[th_mask] = 0.
-                
-                # Predict
-                tmp_pred = predict(i, c_pred=coor_inpaint, img_scaler=img_scaler)
-                for key in tmp_pred.keys():
-                    inpaint_pred_dict[key].extend(tmp_pred[key])
-                
-        else:
-            # Create dataset with overlap sampling for temporal ensemble
-            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='coordinate', pred_dict=tracknet_pred_dict)
-            data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
-            weight = get_ensemble_weight(seq_len, args.eval_mode)
-
-            # Init buffer params
-            num_sample, sample_count = len(dataset), 0
-            buffer_size = seq_len - 1
-            batch_i = torch.arange(seq_len) # [0, 1, 2, 3, 4, 5, 6, 7]
-            frame_i = torch.arange(seq_len-1, -1, -1) # [7, 6, 5, 4, 3, 2, 1, 0]
-            coor_inpaint_buffer = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
-            
-            for step, (i, coor_pred, inpaint_mask) in enumerate(tqdm(data_loader)):
-                coor_pred, inpaint_mask = coor_pred.float(), inpaint_mask.float()
-                b_size = i.shape[0]
-                with torch.no_grad():
-                    coor_inpaint = inpaintnet(coor_pred.to(device), inpaint_mask.to(device)).detach().cpu()
-                    coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask)
-                
-                # Thresholding
-                th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
-                coor_inpaint[th_mask] = 0.
-
-                coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_inpaint), dim=0)
-                ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
-                ensemble_coor_inpaint = torch.empty((0, 1, 2), dtype=torch.float32)
-                
-                for b in range(b_size):
-                    if sample_count < buffer_size:
-                        # Imcomplete buffer
-                        coor_inpaint = coor_inpaint_buffer[batch_i+b, frame_i].sum(0)
-                        coor_inpaint /= (sample_count+1)
-                    else:
-                        # General case
-                        coor_inpaint = (coor_inpaint_buffer[batch_i+b, frame_i] * weight[:, None]).sum(0)
-                    
-                    ensemble_i = torch.cat((ensemble_i, i[b][0].view(1, 1, 2)), dim=0)
-                    ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
-                    sample_count += 1
-
-                    if sample_count == num_sample:
-                        # Last input sequence
-                        coor_zero_pad = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
-                        coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_zero_pad), dim=0)
-                        
-                        for f in range(1, seq_len):
-                            coor_inpaint = coor_inpaint_buffer[batch_i+b+f, frame_i].sum(0)
-                            coor_inpaint /= (seq_len-f)
-                            ensemble_i = torch.cat((ensemble_i, i[-1][f].view(1, 1, 2)), dim=0)
-                            ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
-
-                # Thresholding
-                th_mask = ((ensemble_coor_inpaint[:, :, 0] < COOR_TH) & (ensemble_coor_inpaint[:, :, 1] < COOR_TH))
-                ensemble_coor_inpaint[th_mask] = 0.
-
-                # Predict
-                tmp_pred = predict(ensemble_i, c_pred=ensemble_coor_inpaint, img_scaler=img_scaler)
-                for key in tmp_pred.keys():
-                    inpaint_pred_dict[key].extend(tmp_pred[key])
-                
-                # Update buffer, keep last predictions for ensemble in next iteration
-                coor_inpaint_buffer = coor_inpaint_buffer[-buffer_size:]
-        
-
-    # Write csv file
-    pred_dict = inpaint_pred_dict if inpaintnet is not None else tracknet_pred_dict
-    write_pred_csv(pred_dict, save_file=out_csv_file)
-
-    # Write video with predicted coordinates
+        inpaintnet_seq_len = None
+    settings = dict(vars(args), num_workers=0 if large_video else num_workers,
+                    tracknet_seq_len=tracknet_seq_len, inpaintnet_seq_len=inpaintnet_seq_len,
+                    bg_mode=bg_mode, input_size=[WIDTH, HEIGHT],
+                    coordinate_suppression_threshold=COOR_TH,
+                    repair_policy='same_window_raw_endpoints_v1')
+    raw_pred, pred_dict, video_metadata = predict_video(
+        tracknet, video_file, settings, inpaintnet=inpaintnet, timer=timer)
+    with timer.measure('output_csv'):
+        write_pred_csv(pred_dict, save_file=out_csv_file, save_provenance=args.output_provenance)
     if args.output_video:
-        write_pred_video(video_file, pred_dict, save_file=out_video_file, traj_len=args.traj_len)
+        with timer.measure('output_video'):
+            write_pred_video(video_file, pred_dict, save_file=out_video_file, traj_len=args.traj_len)
+    if args.output_run:
+        raw_metrics = final_metrics = ground_truth = None
+        if args.label_file:
+            with timer.measure('metrics'):
+                labels = pd.read_csv(args.label_file)
+                shape = (video_metadata['width'], video_metadata['height'])
+                raw_metrics = metrics_from_types(evaluate_prediction_dict(raw_pred, labels, shape, args.tolerance)['Type'])
+                final_metrics = metrics_from_types(evaluate_prediction_dict(pred_dict, labels, shape, args.tolerance)['Type'])
+                ground_truth = file_identity(args.label_file)
+        result = video_result(raw_pred, pred_dict, video_metadata, None,
+                              raw_metrics, final_metrics, ground_truth)
+        timing = timer.result(len(pred_dict['Frame']), includes_checkpoint_loading=True)
+        result['timing'] = timing
+        write_run_report(os.path.join(args.save_dir, f'{video_name}_run.json'),
+                         settings, models, [result], timing, device,
+                         evaluation_protocol(args.tolerance) if args.label_file else None)
 
     print('Done.')

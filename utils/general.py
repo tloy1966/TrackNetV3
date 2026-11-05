@@ -35,6 +35,7 @@ class ResumeArgumentParser():
         self.frame_alpha = param_dict['frame_alpha']
         self.mask_ratio = param_dict['mask_ratio']
         self.tolerance = param_dict['tolerance']
+        self.heatmap_threshold = param_dict.get('heatmap_threshold', 0.5)
         self.resume_training = param_dict['resume_training']
         self.seed = param_dict['seed']
         self.save_dir = param_dict['save_dir']
@@ -319,7 +320,7 @@ def write_pred_video(video_file, pred_dict, save_file, traj_len=8, label_df=None
     out.release()
     cap.release()
 
-def write_pred_csv(pred_dict, save_file, save_inpaint_mask=False):
+def write_pred_csv(pred_dict, save_file, save_inpaint_mask=False, save_provenance=False):
     """ Write prediction result to csv file.
 
         Args:
@@ -331,6 +332,8 @@ def write_pred_csv(pred_dict, save_file, save_inpaint_mask=False):
                          'Inpaint_Mask': inpaint_mask (List[int])}
             save_file (str): File path of the output csv file
             save_inpaint_mask (bool, optional): Whether to save inpaint mask
+            save_provenance (bool, optional): Append raw detections and eligible repair mask;
+                unlike save_inpaint_mask, this does not require ground truth.
 
         Returns:
             None
@@ -351,6 +354,9 @@ def write_pred_csv(pred_dict, save_file, save_inpaint_mask=False):
                                 'Visibility': pred_dict['Visibility'],
                                 'X': pred_dict['X'],
                                 'Y': pred_dict['Y']})
+    if save_provenance:
+        for key in ('Visibility_Raw', 'X_Raw', 'Y_Raw', 'Inpaint_Mask'):
+            pred_df[key] = pred_dict[key]
     pred_df.to_csv(save_file, index=False)
     
 def convert_gt_to_coco_json(data_dir, split, drop=False):

@@ -9,45 +9,24 @@ from PIL import Image
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
-
 from dataset import Shuttlecock_Trajectory_Dataset, data_dir
 from utils.general import *
+from utils.inpaint import (
+    format_inpaint_predictions, generate_inpaint_mask,
+    get_ensemble_weight, inpaint_batch, inpaint_trajectory,
+)
 from utils.metric import *
+from utils.runtime import (
+    StageTimer, evaluation_protocol, file_identity, load_checkpoint,
+    model_device, raw_prediction, prediction_statistics, video_result, write_run_report,
+)
+from utils.temporal import iter_heatmap_predictions
 
 
-pred_types = ['TP', 'TN', 'FP1', 'FP2', 'FN']
+pred_types = PRED_TYPES
 pred_types_map = {pred_type: i for i, pred_type in enumerate(pred_types)}
 inpaintnet_eval_types = ['inpaint', 'reconstruct', 'baseline']
 
-
-def get_ensemble_weight(seq_len, eval_mode):
-    """ Get weight for temporal ensemble.
-
-        Args:
-            seq_len (int): Length of input sequence
-            eval_mode (str): Mode of temporal ensemble
-                Choices:
-                    - 'average': Return uniform weight
-                    - 'weight': Return positional weight
-        
-        Returns:
-            weight (torch.Tensor): Weight for temporal ensemble
-    """
-
-    if eval_mode == 'average':
-        weight = torch.ones(seq_len) / seq_len
-    elif eval_mode == 'weight':
-        weight = torch.ones(seq_len)
-        for i in range(math.ceil(seq_len/2)):
-            weight[i] = (i+1)
-            weight[seq_len-i-1] = (i+1)
-        weight = weight / weight.sum()
-    else:
-        raise ValueError('Invalid mode')
-    
-    return weight
 
 def predict_location(heatmap):
     """ Get coordinates from the heatmap.
@@ -78,7 +57,7 @@ def predict_location(heatmap):
 
         return x, y, w, h
 
-def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolerance=4., img_scaler=(1, 1), output_bbox=False, output_gt=False):
+def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolerance=4., img_scaler=(1, 1), output_bbox=False, output_gt=False, heatmap_threshold=0.5):
     """ Predict and output the result of each frame.
 
         Args:
@@ -90,6 +69,7 @@ def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolera
             tolerance (float) - Tolerance for FP1
             img_scaler (Tuple[float, float]) - Scaler of input image size to original image size
             output_bbox (bool) - Whether to output detection result
+            heatmap_threshold (float) - Finite [0,1] strict heatmap decoding threshold
         
         Returns:
             pred_dict (Dict) - Prediction result
@@ -99,7 +79,7 @@ def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolera
     pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[], 'BBox': [], 'Confidence':[], 'X_GT':[], 'Y_GT':[], 'Visibility_GT':[]}
 
     batch_size, seq_len = indices.shape[0], indices.shape[1]
-    indices = indices.detach().cpu().numpy().tolist() if torch.is_tensor(indices) else indices.numpy().tolist()
+    indices = indices.detach().cpu().numpy().tolist() if torch.is_tensor(indices) else np.asarray(indices).tolist()
 
     # Transform input for heatmap prediction
     if y_true is not None and y_pred is not None:
@@ -108,14 +88,14 @@ def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolera
         y_pred = y_pred.detach().cpu().numpy() if torch.is_tensor(y_pred) else y_pred
         y_true = to_img_format(y_true) # (N, L, H, W)
         y_pred = to_img_format(y_pred) # (N, L, H, W)
-        h_pred = y_pred > 0.5
+        h_pred = y_pred > validate_heatmap_threshold(heatmap_threshold)
     
     # Transform input for coordinate prediction
     if c_true is not None and c_pred is not None:
         assert y_true is None and y_pred is None, 'Invalid input'
         assert output_bbox == False, 'Coordinate prediction cannot output detection'
-        c_true = c_true.detach().cpu().numpy() if torch.is_tensor(c_true) else c_true
-        c_pred = c_pred.detach().cpu().numpy() if torch.is_tensor(c_pred) else c_pred
+        c_true = c_true.detach().cpu().numpy().copy() if torch.is_tensor(c_true) else np.array(c_true, copy=True)
+        c_pred = c_pred.detach().cpu().numpy().copy() if torch.is_tensor(c_pred) else np.array(c_pred, copy=True)
         c_true[..., 0] = c_true[..., 0] * WIDTH
         c_true[..., 1] = c_true[..., 1] * HEIGHT
         c_pred[..., 0] = c_pred[..., 0] * WIDTH
@@ -220,69 +200,54 @@ def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolera
     
     return pred_dict
 
-def generate_inpaint_mask(pred_dict, th_h=30):
-    """ Generate inpaint mask form predicted trajectory.
 
-        Args:
-            pred_dict (Dict): Prediction result
-                Format: {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
-            th_h (float): Height threshold (pixels) for y coordinate
-        
-        Returns:
-            inpaint_mask (List): Inpaint mask
-    """
-    y = np.array(pred_dict['Y'])
-    vis_pred = np.array(pred_dict['Visibility'])
-    inpaint_mask = np.zeros_like(y)
-    i = 0 # index that ball start to disappear
-    j = 0 # index that ball start to appear
-    threshold = th_h
-    while j < len(vis_pred):
-        while i < len(vis_pred)-1 and vis_pred[i] == 1:
-            i += 1
-        j = i
-        while j < len(vis_pred)-1 and vis_pred[j] == 0:
-            j += 1
-        if j == i:
-            break
-        elif i == 0 and y[j] > threshold:
-            # start from the first frame that ball disappear
-            inpaint_mask[:j] = 1
-        elif (i > 1 and y[i-1] > threshold) and (j < len(vis_pred) and y[j] > threshold):
-            inpaint_mask[i:j] = 1
-        else:
-            # ball is out of the field of camera view 
-            pass
-        i = j
-    
-    return inpaint_mask.tolist()
+def evaluate_prediction_dict(prediction, labels, img_shape, tolerance=4.):
+    """Compare original-pixel CSV predictions using the existing input-pixel evaluator."""
+    evaluation_protocol(tolerance)
+    prediction_statistics(prediction)
+    required = {'Frame', 'X', 'Y', 'Visibility'}
+    if not required.issubset(labels.columns):
+        raise ValueError('Ground truth must contain Frame, X, Y, and Visibility')
+    if labels['Frame'].duplicated().any() or set(labels['Frame']) != set(prediction['Frame']):
+        raise ValueError('Ground truth must match output Frame IDs exactly, without duplicates')
+    labels = labels.set_index('Frame').loc[prediction['Frame']]
+    if not np.isin(labels['Visibility'], [0, 1]).all():
+        raise ValueError('Ground-truth visibility must contain only 0 or 1')
+    predicted = np.column_stack((prediction['X'], prediction['Y'])).astype(np.float64)
+    truth = labels[['X', 'Y']].to_numpy(dtype=np.float64)
+    if not np.isfinite(predicted).all() or not np.isfinite(truth).all():
+        raise ValueError('Prediction and ground-truth coordinates must be finite')
+    if len(prediction['Frame']) == 0:
+        return {'Frame': [], 'X': [], 'Y': [], 'Visibility': [], 'Type': []}
+    if len(img_shape) != 2 or not all(math.isfinite(value) and value > 0 for value in img_shape):
+        raise ValueError('Image shape must contain positive, finite width and height')
+    predicted[np.asarray(prediction['Visibility']) == 0] = 0.
+    truth[labels['Visibility'].to_numpy() == 0] = 0.
+    indices = np.column_stack((np.zeros(len(predicted), dtype=np.int64),
+                               np.asarray(prediction['Frame'], dtype=np.int64)))
+    return evaluate(indices[:, None, :], c_true=(truth / img_shape)[:, None, :],
+                    c_pred=(predicted / img_shape)[:, None, :], tolerance=tolerance)
+
 
 def linear_interp(target, inpaint_mask):
-    assert len(target) == len(inpaint_mask), 'Length of target and inpaint_mask should be the same'
-    target = np.array(target)
-    inpaint_mask = np.array(inpaint_mask)
-    i = 0 # index that ball start to disappear
-    j = 0 # index that ball start to appear
-    while j < len(inpaint_mask):
-        while i < len(inpaint_mask)-1 and inpaint_mask[i] == 0:
-            i += 1
-        j = i
-        while j < len(inpaint_mask)-1 and inpaint_mask[j] == 1:
-            j += 1
-        if j == i:
-            break
-        else:
-            x = np.linspace(0, 1, len(inpaint_mask[i:j]))
-            xp = [0, 1]
-            if i == 0:
-                fp = [target[j], target[j]]
-            elif j == len(inpaint_mask)-1:
-                fp = [target[i-1], target[i-1]]
-            else:
-                fp = [target[i-1], target[j]]
-            target[i:j] = np.interp(x, xp, fp)
-        i = j
-    
+    """Interpolate bounded masked runs without extrapolating either endpoint."""
+    if len(target) != len(inpaint_mask):
+        raise ValueError('Target and inpaint mask must have equal lengths')
+    if not np.isin(inpaint_mask, [0, 1]).all():
+        raise ValueError('Inpaint mask must contain only 0 or 1')
+    target = np.array(target, dtype=np.float64, copy=True)
+    start = 0
+    while start < len(inpaint_mask):
+        if inpaint_mask[start] == 0:
+            start += 1
+            continue
+        end = start
+        while end < len(inpaint_mask) and inpaint_mask[end] == 1:
+            end += 1
+        if start > 0 and end < len(inpaint_mask):
+            target[start:end] = np.interp(np.arange(start, end), [start - 1, end],
+                                          [target[start - 1], target[end]])
+        start = end
     return target
 
 # Only for training evaluation, won't save the result
@@ -343,7 +308,8 @@ def eval_tracknet(model, data_loader, param_dict):
         loss = WBCELoss(y_pred, y)
         losses.append(loss.item())
 
-        pred_dict = evaluate(i, y_true=y, y_pred=y_pred, tolerance=param_dict['tolerance'])
+        pred_dict = evaluate(i, y_true=y, y_pred=y_pred, tolerance=param_dict['tolerance'],
+                             heatmap_threshold=param_dict.get('heatmap_threshold', 0.5))
         confusion_matrix += get_eval_res(pred_dict)
         
         if param_dict['verbose']:
@@ -364,10 +330,10 @@ def eval_tracknet(model, data_loader, param_dict):
     return float(np.mean(losses)), res_dict
 
 def eval_inpaintnet(model, data_loader, param_dict):
-    """ Evaluate TrackNet model.
+    """ Evaluate InpaintNet with the same observation-bounded window policy as inference.
 
         Args:
-            model (nn.Module): TrackNet model
+            model (nn.Module): InpaintNet model
             data_loader (torch.utils.data.DataLoader): DataLoader for evaluation
             param_dict (Dict): Parameters
                 param_dict['verbose'] (bool): Whether to show progress bar
@@ -393,19 +359,16 @@ def eval_inpaintnet(model, data_loader, param_dict):
     else:
         data_prob = data_loader
 
-    for step, (i, coor_pred, coor, _, _, inpaint_mask) in enumerate(data_prob):
+    for step, (i, coor_pred, coor, pred_vis, _, inpaint_mask) in enumerate(data_prob):
         coor_pred, coor, inpaint_mask = coor_pred.float().cuda(), coor.float().cuda(), inpaint_mask.float().cuda()
+        coor_pred = coor_pred.masked_fill(~pred_vis.cuda().bool(), 0.)
         
         with torch.no_grad():
-            coor_inpaint = model(coor_pred, inpaint_mask)
-            coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask)
+            coor_inpaint, repair_mask = inpaint_batch(
+                model, coor_pred, inpaint_mask, indices=i, coor_th=COOR_TH)
             
-            loss = nn.MSELoss()(coor_inpaint * inpaint_mask, coor * inpaint_mask)
+            loss = nn.MSELoss()(coor_inpaint * repair_mask, coor * repair_mask)
             losses.append(loss.item())
-
-            # Thresholding
-            th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
-            coor_inpaint[th_mask] = 0.
         
         for eval_type in inpaintnet_eval_types:
             if eval_type == 'inpaint':
@@ -452,12 +415,13 @@ def get_coco_res(pred_dict, drop=False):
     """
     sample_count = 0
     res_list = []
+    if drop and pred_dict:
+        with open(os.path.join(data_dir, 'drop_frame.json')) as source:
+            drop_frame_dict = json.load(source)
+        start_f, end_f = drop_frame_dict['start'], drop_frame_dict['end']
     for rally_key, pred in pred_dict.items():
         if drop:
-            drop_frame_dict = json.load(open(os.path.join(data_dir, 'drop_frame.json')))
-            start_f, end_f = drop_frame_dict['start'], drop_frame_dict['end']
-            for key in pred.keys():
-                pred[key] = pred[key][start_f[rally_key]:end_f[rally_key]]
+            pred = {key: values[start_f[rally_key]:end_f[rally_key]] for key, values in pred.items()}
         
         for i in range(len(pred['Frame'])):
             if pred['Visibility'][i] > 0:
@@ -474,7 +438,7 @@ def get_coco_res(pred_dict, drop=False):
     
     return res_list
 
-def get_test_res(pred_dict, drop=False):
+def get_test_res(pred_dict, drop=False, type_key='Type'):
     """ Parse prediction result and get evaluation result.
 
         Args:
@@ -494,13 +458,15 @@ def get_test_res(pred_dict, drop=False):
     """
 
     res_dict = {pred_type: 0 for pred_type in pred_types}
+    if drop and pred_dict:
+        with open(os.path.join(data_dir, 'drop_frame.json')) as source:
+            drop_frame_dict = json.load(source)
+        start_f, end_f = drop_frame_dict['start'], drop_frame_dict['end']
     for rally_key, pred in pred_dict.items():
         if drop:
-            drop_frame_dict = json.load(open(os.path.join(data_dir, 'drop_frame.json')))
-            start_f, end_f = drop_frame_dict['start'], drop_frame_dict['end']
-            type_res = np.array(pred['Type'])[start_f[rally_key]:end_f[rally_key]]
+            type_res = np.array(pred[type_key])[start_f[rally_key]:end_f[rally_key]]
         else:
-            type_res = np.array(pred['Type'])
+            type_res = np.array(pred[type_key])
         
         # Calculate metrics
         for pred_type in pred_types:
@@ -518,7 +484,29 @@ def get_test_res(pred_dict, drop=False):
     
     return res_dict
 
-def test(model, split, param_dict, save_inpaint_mask=False, linear_interp=False):
+def rally_run_result(pred, info, param_dict, rally_key, drop=False):
+    final = dict(pred)
+    if info['repair_method'] == 'none':
+        final['Inpaint_Mask'] = [0] * len(final['Frame'])
+    evaluated = pred
+    metadata = {key: value for key, value in info.items() if key != 'ground_truth'}
+    if drop:
+        with open(os.path.join(data_dir, 'drop_frame.json')) as source:
+            ranges = json.load(source)
+        start, end = ranges['start'][rally_key], ranges['end'][rally_key]
+        evaluated = {key: pred[key][start:end] for key in ('Type', 'Type_Raw')}
+        metadata['evaluation_rows'] = {'start_inclusive': start, 'end_exclusive': end}
+    raw_metrics = get_test_res({rally_key: evaluated}, type_key='Type_Raw')
+    final_metrics = get_test_res({rally_key: evaluated})
+    result = video_result(raw_prediction(final), final, metadata, None,
+                          raw_metrics, final_metrics, info['ground_truth'])
+    result['evaluated_frames'] = sum(final_metrics[key] for key in pred_types)
+    result['evaluation_protocol'] = evaluation_protocol(param_dict['tolerance'])
+    return result
+
+
+def test(model, split, param_dict, save_inpaint_mask=False, linear_interp=False,
+         timer=None, run_results=None, run_models=None):
     """ Test model on all the rallies in the split.
 
         Args:
@@ -543,6 +531,7 @@ def test(model, split, param_dict, save_inpaint_mask=False, linear_interp=False)
 
     # Rally-based test
     pred_dict = {}
+    timer = timer if timer is not None else StageTimer()
     rally_dirs = get_rally_dirs(data_dir, split)
     rally_dirs = [os.path.join(data_dir, rally_dir) for rally_dir in rally_dirs]
     if param_dict['debug']:
@@ -555,22 +544,38 @@ def test(model, split, param_dict, save_inpaint_mask=False, linear_interp=False)
         match_id = match_dir.split('match')[-1]
         rally_key = f'{match_id}_{rally_id}'
 
-        # Test
+        video_timer = StageTimer(run_results is not None)
+        run_info = {} if run_results is not None else None
         if linear_interp:
-            tmp_pred = test_rally_linear(model, rally_dir, param_dict)
+            tmp_pred = test_rally_linear(model, rally_dir, param_dict, timer=video_timer, run_info=run_info)
         else:
-            tmp_pred = test_rally(model, rally_dir, param_dict, save_inpaint_mask=save_inpaint_mask)
+            tmp_pred = test_rally(model, rally_dir, param_dict, save_inpaint_mask=save_inpaint_mask,
+                                  timer=video_timer, run_info=run_info)
         pred_dict[rally_key] = tmp_pred
 
         if save_inpaint_mask:
             if not os.path.exists(os.path.join(match_dir, 'predicted_csv')):
                 os.makedirs(os.path.join(match_dir, 'predicted_csv'))
             csv_file = os.path.join(match_dir, 'predicted_csv',f'{rally_id}_ball.csv')
-            write_pred_csv(tmp_pred, save_file=csv_file, save_inpaint_mask=save_inpaint_mask)
+            with video_timer.measure('output_csv'):
+                write_pred_csv(tmp_pred, save_file=csv_file, save_inpaint_mask=save_inpaint_mask)
+        if run_results is not None:
+            with video_timer.measure('metrics'):
+                result = rally_run_result(tmp_pred, run_info, param_dict, rally_key,
+                                          drop=split == 'test' and not save_inpaint_mask)
+            if save_inpaint_mask:
+                result['prediction_csv'] = file_identity(csv_file)
+            result['timing'] = video_timer.result(len(tmp_pred['Frame']))
+            if save_inpaint_mask:
+                write_run_report(csv_file + '.run.json', param_dict, run_models, [result],
+                                 result['timing'], model_device(model[0]),
+                                 evaluation_protocol(param_dict['tolerance']))
+            run_results.append(result)
+        timer.merge(video_timer)
     
     return pred_dict
 
-def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
+def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False, timer=None, run_info=None):
     """ Test model on a single rally.
 
         Args:
@@ -597,7 +602,28 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
     """
 
     tracknet, inpaintnet = model
-    w, h = Image.open(os.path.join(rally_dir, '0.png')).size
+    timer = timer if timer is not None else StageTimer()
+    with Image.open(os.path.join(rally_dir, '0.png')) as image:
+        w, h = image.size
+    if run_info is not None:
+        run_info.update(path=rally_dir, width=w, height=h, fps=None,
+                        input_source='rally_images' if tracknet is not None else 'cached_coordinates',
+                        heatmap_threshold_applied=param_dict.get('heatmap_threshold', 0.5) if tracknet is not None else None)
+        match_dir, rally_id = parse.parse(os.path.join('{}', 'frame', '{}'), rally_dir)
+        video_file = os.path.join(match_dir, 'video', f'{rally_id}.mp4')
+        run_info['video_file'] = {'path': video_file, 'available': os.path.isfile(video_file)}
+        if os.path.isfile(video_file):
+            with timer.measure('video_probe'):
+                cap = cv2.VideoCapture(video_file)
+                try:
+                    opened = cap.isOpened()
+                    run_info['video_file']['probe_success'] = bool(opened)
+                    if opened:
+                        fps = float(cap.get(cv2.CAP_PROP_FPS))
+                        run_info['fps'] = fps if math.isfinite(fps) and fps > 0 else None
+                        run_info['declared_frames'] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                finally:
+                    cap.release()
     if save_inpaint_mask:
         w_scaler, h_scaler = 1., 1.
     else:
@@ -609,300 +635,159 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
         seq_len = param_dict['tracknet_seq_len']
         tracknet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[], 'BBox': [], 'Confidence':[], 'X_GT':[], 'Y_GT':[], 'Visibility_GT':[]}
 
-        if param_dict['eval_mode'] == 'nonoverlap':
-            # Create dataset with non-overlap sampling
-            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='heatmap', bg_mode=param_dict['bg_mode'], rally_dir=rally_dir, padding=True)
+        nonoverlap = param_dict['eval_mode'] == 'nonoverlap'
+        step = seq_len if nonoverlap or get_num_frames(rally_dir) < seq_len else 1
+        with timer.measure('input_setup'):
+            dataset = Shuttlecock_Trajectory_Dataset(
+                root_dir=data_dir, seq_len=seq_len, sliding_step=step, data_mode='heatmap',
+                bg_mode=param_dict['bg_mode'], rally_dir=rally_dir, padding=step == seq_len)
             data_loader = DataLoader(dataset, batch_size=param_dict['batch_size'], shuffle=False, num_workers=param_dict['num_workers'], drop_last=False)
-            
-            data_prob = tqdm(data_loader) if param_dict['verbose'] else data_loader
-            for step, (i, x, y, _, _) in enumerate(data_prob):
-                x = x.float().cuda()
-                with torch.no_grad():
-                    y_pred = tracknet(x).detach().cpu()
-                
-                # Predict
+        data_prob = tqdm(data_loader) if param_dict['verbose'] else data_loader
+        for i, y, y_pred in iter_heatmap_predictions(
+                tracknet, data_prob, param_dict['eval_mode'], model_device(tracknet), timer):
+            with timer.measure('postprocess'):
                 tmp_pred = evaluate(i, y_true=y, y_pred=y_pred,
-                                    tolerance=param_dict['tolerance'],
-                                    img_scaler=(w_scaler, h_scaler),
-                                    output_bbox=param_dict['output_bbox'],
-                                    output_gt=param_dict['output_gt'])
+                                    tolerance=param_dict['tolerance'], img_scaler=(w_scaler, h_scaler),
+                                    output_bbox=param_dict['output_bbox'], output_gt=param_dict['output_gt'],
+                                    heatmap_threshold=param_dict.get('heatmap_threshold', 0.5))
                 for key in tmp_pred.keys():
                     tracknet_pred_dict[key].extend(tmp_pred[key])
-        else:
-            # Create dataset with overlap sampling for temporal ensemble
-            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='heatmap', bg_mode=param_dict['bg_mode'], rally_dir=rally_dir)
-            data_loader = DataLoader(dataset, batch_size=param_dict['batch_size'], shuffle=False, num_workers=param_dict['num_workers'], drop_last=False)
-            weight = get_ensemble_weight(seq_len, param_dict['eval_mode'])
-
-            # Init buffer parameters
-            num_sample, sample_count = len(dataset), 0
-            buffer_size = seq_len - 1
-            batch_i = torch.arange(seq_len) # [0, 1, 2, 3, 4, 5, 6, 7]
-            frame_i = torch.arange(seq_len-1, -1, -1) # [7, 6, 5, 4, 3, 2, 1, 0]
-            y_pred_buffer = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
-
-            data_prob = tqdm(data_loader) if param_dict['verbose'] else data_loader
-            for step, (i, x, y, _, _) in enumerate(data_prob):
-                x = x.float().cuda()
-                b_size, seq_len = i.shape[0], i.shape[1]
-                with torch.no_grad():
-                    y_pred = tracknet(x).detach().cpu()
-                
-                y_pred_buffer = torch.cat((y_pred_buffer, y_pred), dim=0)
-                ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
-                ensemble_y = torch.empty((0, 1, HEIGHT, WIDTH), dtype=torch.float32)
-                ensemble_y_pred = torch.empty((0, 1, HEIGHT, WIDTH), dtype=torch.float32)
-
-                for b in range(b_size):
-                    if sample_count < buffer_size:
-                        # Imcomplete buffer
-                        y_pred = y_pred_buffer[batch_i+b, frame_i].sum(0)
-                        y_pred /= (sample_count+1)
-                    else:
-                        # General case
-                        y_pred = (y_pred_buffer[batch_i+b, frame_i] * weight[:, None, None]).sum(0)
-                        
-                    ensemble_i = torch.cat((ensemble_i, i[b][0].reshape(1, 1, 2)), dim=0)
-                    ensemble_y = torch.cat((ensemble_y, y[b][0].reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                    ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                    sample_count += 1
-
-                    if sample_count == num_sample:
-                        # Last input sequence
-                        y_zero_pad = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
-                        y_pred_buffer = torch.cat((y_pred_buffer, y_zero_pad), dim=0)
-
-                        for f in range(1, seq_len):
-                            y_pred = y_pred_buffer[batch_i+b+f, frame_i].sum(0)
-                            y_pred /= (seq_len-f)
-                            ensemble_i = torch.cat((ensemble_i, i[-1][f].reshape(1, 1, 2)), dim=0)
-                            ensemble_y = torch.cat((ensemble_y, y[-1][f].reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                            ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                        
-                # Predict
-                tmp_pred = evaluate(ensemble_i, y_true=ensemble_y, y_pred=ensemble_y_pred,
-                                    tolerance=param_dict['tolerance'],
-                                    img_scaler=(w_scaler, h_scaler),
-                                    output_bbox=param_dict['output_bbox'],
-                                    output_gt=param_dict['output_gt'])
-                for key in tmp_pred.keys():
-                    tracknet_pred_dict[key].extend(tmp_pred[key])
-
-                # Update buffer, keep last predictions for ensemble in next iteration
-                y_pred_buffer = y_pred_buffer[-buffer_size:]
         
         tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(tracknet_pred_dict, th_h=30)
+        if param_dict.get('output_provenance', False) and not save_inpaint_mask:
+            tracknet_pred_dict.update(format_inpaint_predictions(
+                tracknet_pred_dict, torch.zeros((len(tracknet_pred_dict['Frame']), 2)),
+                torch.zeros((len(tracknet_pred_dict['Frame']), 1), dtype=torch.bool), (w, h)))
+        if run_info is not None:
+            tracknet_pred_dict['Type_Raw'] = list(tracknet_pred_dict['Type'])
+            for key in ('X', 'Y', 'Visibility'):
+                tracknet_pred_dict[f'{key}_Raw'] = list(tracknet_pred_dict[key])
+            file_format_str = os.path.join('{}', 'frame', '{}')
+            match_dir, rally_id = parse.parse(file_format_str, rally_dir)
+            label_dir = 'corrected_csv' if 'test' in rally_dir else 'csv'
+            run_info.update(processed_frames=len(tracknet_pred_dict['Frame']), raw_source='fresh_tracknet',
+                            ground_truth=file_identity(os.path.join(match_dir, label_dir, f'{rally_id}_ball.csv')),
+                            repair_method='none', num_workers=data_loader.num_workers)
+            if param_dict['bg_mode']:
+                median_file = os.path.join(match_dir, 'median.npz')
+                if not os.path.isfile(median_file):
+                    median_file = os.path.join(rally_dir, 'median.npz')
+                run_info['background_file'] = file_identity(median_file)
         return tracknet_pred_dict
     else:
         # Test on TrackNetV3 (TrackNet + InpaintNet)
         inpaintnet.eval()
         seq_len = param_dict['inpaintnet_seq_len']
-        inpaintnet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[]}
-
-        if param_dict['eval_mode'] == 'nonoverlap':
-            # Create dataset with non-overlap sampling
-            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='coordinate', rally_dir=rally_dir, padding=True)
-            data_loader = DataLoader(dataset, batch_size=param_dict['batch_size'], shuffle=False, num_workers=param_dict['num_workers'], drop_last=False)
-
-            data_prob = tqdm(data_loader) if param_dict['verbose'] else data_loader
-            for step, (i, coor_pred, coor, _, _, inpaint_mask) in enumerate(data_prob):
-                coor_pred, coor, inpaint_mask = coor_pred.float(), coor.float(), inpaint_mask.float()
-                with torch.no_grad():
-                    coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
-                    coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask) # replace predicted coordinates with inpainted coordinates
-                
-                # Thresholding
-                th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
-                coor_inpaint[th_mask] = 0.
-                
-                # Predict
-                tmp_pred = evaluate(i, c_true=coor, c_pred=coor_inpaint, tolerance=param_dict['tolerance'], img_scaler=(w_scaler, h_scaler))
-                for key in tmp_pred.keys():
-                    inpaintnet_pred_dict[key].extend(tmp_pred[key])
+        file_format_str = os.path.join('{}', 'frame', '{}')
+        match_dir, rally_id = parse.parse(file_format_str, rally_dir)
+        pred_csv_file = os.path.join(match_dir, 'predicted_csv', f'{rally_id}_ball.csv')
+        if tracknet is not None:
+            tracking_info = {} if run_info is not None else None
+            tracking = test_rally(
+                (tracknet, None), rally_dir,
+                dict(param_dict, output_gt=True, output_bbox=False, output_provenance=False),
+                save_inpaint_mask=True, timer=timer, run_info=tracking_info)
+            pred_df = pd.DataFrame({key: tracking[key] for key in
+                                    ('Frame', 'X', 'Y', 'Visibility', 'X_GT', 'Y_GT', 'Visibility_GT', 'Inpaint_Mask')})
+            if run_info is not None:
+                run_info.update(tracking_info)
         else:
-            # Create dataset with overlap sampling for temporal ensemble
-            dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='coordinate', rally_dir=rally_dir)
-            data_loader = DataLoader(dataset, batch_size=param_dict['batch_size'], shuffle=False, num_workers=param_dict['num_workers'], drop_last=False)
-            weight = get_ensemble_weight(seq_len, param_dict['eval_mode'])
+            with timer.measure('input_setup'):
+                pred_df = pd.read_csv(pred_csv_file, encoding='utf8').sort_values(by='Frame').fillna(0)
+            if run_info is not None:
+                cache_identity = file_identity(pred_csv_file)
+                run_info.update(raw_source='cached_coordinates', prediction_cache=cache_identity,
+                                ground_truth=dict(cache_identity, columns=['X_GT', 'Y_GT', 'Visibility_GT']),
+                                requested_heatmap_threshold=param_dict.get('heatmap_threshold', 0.5),
+                                cache_generation=None, num_workers=0)
+                sidecar = pred_csv_file + '.run.json'
+                if os.path.isfile(sidecar):
+                    with open(sidecar, encoding='utf8') as source:
+                        generation = json.load(source)
+                    generated_video = generation['videos'][0]
+                    if generated_video['prediction_csv']['sha256'] != cache_identity['sha256']:
+                        raise ValueError('Cached prediction CSV no longer matches its run sidecar; regenerate it')
+                    run_info['heatmap_threshold_applied'] = validate_heatmap_threshold(
+                        generation['settings']['heatmap_threshold'])
+                    run_info['cache_generation'] = {
+                        'sidecar': file_identity(sidecar), 'models': generation['models'],
+                        'heatmap_threshold': run_info['heatmap_threshold_applied'],
+                    }
+        raw_pred = {key: pred_df[key].tolist() for key in ('Frame', 'X', 'Y', 'Visibility')}
+        coordinates = torch.tensor(pred_df[['X', 'Y']].to_numpy(), dtype=torch.float32)
+        coordinates /= torch.tensor((WIDTH, HEIGHT))
+        coordinates[torch.tensor(raw_pred['Visibility']) == 0] = 0.
+        raw_coordinates = coordinates.clone() if run_info is not None else None
+        candidates = np.asarray(generate_inpaint_mask(raw_pred, th_h=30, seq_len=seq_len), dtype=np.int64)
+        cached_mask = pred_df['Inpaint_Mask'].to_numpy()
+        if not np.isin(cached_mask, [0, 1]).all():
+            raise ValueError('Stored Inpaint_Mask must contain only 0 or 1')
+        candidates &= cached_mask.astype(np.int64)
+        indices = torch.stack((torch.zeros(len(pred_df), dtype=torch.long),
+                               torch.tensor(raw_pred['Frame'], dtype=torch.long)), dim=1)
+        with timer.measure('inpainting', model_device(inpaintnet)):
+            coordinates, repair_mask = inpaint_trajectory(
+                inpaintnet, coordinates, torch.tensor(candidates, dtype=torch.float32).reshape(-1, 1),
+                seq_len, eval_mode=param_dict['eval_mode'], batch_size=param_dict['batch_size'],
+                device=model_device(inpaintnet), indices=indices, coor_th=COOR_TH, timer=timer)
 
-            # Init buffer params
-            num_sample, sample_count = len(dataset), 0
-            buffer_size = seq_len - 1
-            batch_i = torch.arange(seq_len) # [0, 1, 2, 3, 4, 5, 6, 7]
-            frame_i = torch.arange(seq_len-1, -1, -1) # [7, 6, 5, 4, 3, 2, 1, 0]
-            coor_inpaint_buffer = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
-
-            data_prob = tqdm(data_loader) if param_dict['verbose'] else data_loader
-            for step, (i, coor_pred, coor, _, _, inpaint_mask) in enumerate(data_prob):
-                coor_pred, coor, inpaint_mask = coor_pred.float(), coor.float(), inpaint_mask.float()
-                b_size = i.shape[0]
-                with torch.no_grad():
-                    coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
-                    coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1 - inpaint_mask) # replace predicted coordinates with inpainted coordinates
-                
-                # Thresholding
-                th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
-                coor_inpaint[th_mask] = 0.
-
-                coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_inpaint), dim=0)
-                ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
-                ensemble_coor = torch.empty((0, 1, 2), dtype=torch.float32)
-                ensemble_coor_inpaint = torch.empty((0, 1, 2), dtype=torch.float32)
-                
-                for b in range(b_size):
-                    if sample_count < buffer_size:
-                        # Imcomplete buffer
-                        coor_inpaint = coor_inpaint_buffer[batch_i+b, frame_i].sum(0)
-                        coor_inpaint /= (sample_count+1)  
-                    else:
-                        # General case
-                        coor_inpaint = (coor_inpaint_buffer[batch_i+b, frame_i] * weight[:, None]).sum(0)
-                    
-                    ensemble_i = torch.cat((ensemble_i, i[b][0].view(1, 1, 2)), dim=0)
-                    ensemble_coor = torch.cat((ensemble_coor, coor[b][0].view(1, 1, 2)), dim=0)
-                    ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
-                    sample_count += 1
-                
-                    if sample_count == num_sample:
-                        # Last input sequence
-                        coor_zero_pad = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
-                        coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_zero_pad), dim=0)
-                        
-                        for f in range(1, seq_len):
-                            coor_inpaint = coor_inpaint_buffer[batch_i+b+f, frame_i].sum(0)
-                            coor_inpaint /= (seq_len-f)
-                            ensemble_i = torch.cat((ensemble_i, i[b][f].view(1, 1, 2)), dim=0)
-                            ensemble_coor = torch.cat((ensemble_coor, coor[b][f].view(1, 1, 2)), dim=0)
-                            ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
-                
-                # Thresholding
-                th_mask = ((ensemble_coor_inpaint[:, :, 0] < COOR_TH) & (ensemble_coor_inpaint[:, :, 1] < COOR_TH))
-                ensemble_coor_inpaint[th_mask] = 0.
-
-                # Predict
-                tmp_pred = evaluate(ensemble_i, c_true=ensemble_coor, c_pred=ensemble_coor_inpaint,
-                                    tolerance=param_dict['tolerance'],
-                                    img_scaler=(w_scaler, h_scaler))
-                for key in tmp_pred.keys():
-                    inpaintnet_pred_dict[key].extend(tmp_pred[key])
-
-                # Update buffer, keep last predictions for ensemble in next iteration
-                coor_inpaint_buffer = coor_inpaint_buffer[-buffer_size:]
-
+        ground_truth = torch.tensor(pred_df[['X_GT', 'Y_GT']].to_numpy(), dtype=torch.float32)
+        ground_truth /= torch.tensor((WIDTH, HEIGHT))
+        ground_truth[torch.tensor(pred_df['Visibility_GT'].to_numpy()) == 0] = 0.
+        with timer.measure('postprocess'):
+            inpaintnet_pred_dict = evaluate(
+                indices[:, None, :], c_true=ground_truth[:, None, :], c_pred=coordinates[:, None, :],
+                tolerance=param_dict['tolerance'], img_scaler=(w_scaler, h_scaler))
+        if run_info is not None:
+            inpaintnet_pred_dict['Type_Raw'] = evaluate(
+                indices[:, None, :], c_true=ground_truth[:, None, :], c_pred=raw_coordinates[:, None, :],
+                tolerance=param_dict['tolerance'])['Type']
+            run_info.update(processed_frames=len(raw_pred['Frame']), repair_method='inpaintnet')
+        raw_pred['X'] = [int(x * w_scaler) for x in raw_pred['X']]
+        raw_pred['Y'] = [int(y * h_scaler) for y in raw_pred['Y']]
+        img_shape = (WIDTH, HEIGHT) if save_inpaint_mask else (w, h)
+        inpaintnet_pred_dict.update(format_inpaint_predictions(
+            raw_pred, coordinates, repair_mask, img_shape))
         return inpaintnet_pred_dict
         
-def test_rally_linear(model, rally_dir, param_dict):
+def test_rally_linear(model, rally_dir, param_dict, timer=None, run_info=None):
     tracknet, _ = model
-    w, h = Image.open(os.path.join(rally_dir, '0.png')).size
+    with Image.open(os.path.join(rally_dir, '0.png')) as image:
+        w, h = image.size
     w_scaler, h_scaler = w / WIDTH, h / HEIGHT
 
-    # Test on TrackNet
-    tracknet.eval()
-    seq_len = param_dict['tracknet_seq_len']
-    tracknet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[]}
-
-    if param_dict['eval_mode'] == 'nonoverlap':
-        # Create dataset with non-overlap sampling
-        dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='heatmap', bg_mode=param_dict['bg_mode'], rally_dir=rally_dir, padding=True)
-        data_loader = DataLoader(dataset, batch_size=param_dict['batch_size'], shuffle=False, num_workers=param_dict['num_workers'], drop_last=False)
-        
-        data_prob = tqdm(data_loader) if param_dict['verbose'] else data_loader
-        for step, (i, x, y, _, _) in enumerate(data_prob):
-            x = x.float().cuda()
-            with torch.no_grad():
-                y_pred = tracknet(x).detach().cpu()
-            
-            # Predict
-            tmp_pred = evaluate(i, y_true=y, y_pred=y_pred, tolerance=param_dict['tolerance'])
-            for key in tmp_pred.keys():
-                tracknet_pred_dict[key].extend(tmp_pred[key])
-    else:
-        # Create dataset with overlap sampling for temporal ensemble
-        dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='heatmap', bg_mode=param_dict['bg_mode'], rally_dir=rally_dir)
-        data_loader = DataLoader(dataset, batch_size=param_dict['batch_size'], shuffle=False, num_workers=param_dict['num_workers'], drop_last=False)
-        weight = get_ensemble_weight(seq_len, param_dict['eval_mode'])
-
-        # Init buffer parameters
-        num_sample, sample_count = len(dataset), 0
-        buffer_size = seq_len - 1
-        batch_i = torch.arange(seq_len) # [0, 1, 2, 3, 4, 5, 6, 7]
-        frame_i = torch.arange(seq_len-1, -1, -1) # [7, 6, 5, 4, 3, 2, 1, 0]
-        y_pred_buffer = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
-
-        data_prob = tqdm(data_loader) if param_dict['verbose'] else data_loader
-        for step, (i, x, y, _, _) in enumerate(data_prob):
-            x = x.float().cuda()
-            b_size, seq_len = i.shape[0], i.shape[1]
-            with torch.no_grad():
-                y_pred = tracknet(x).detach().cpu()
-            
-            y_pred_buffer = torch.cat((y_pred_buffer, y_pred), dim=0)
-            ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
-            ensemble_y = torch.empty((0, 1, HEIGHT, WIDTH), dtype=torch.float32)
-            ensemble_y_pred = torch.empty((0, 1, HEIGHT, WIDTH), dtype=torch.float32)
-
-            for b in range(b_size):
-                if sample_count < buffer_size:
-                    # Imcomplete buffer
-                    y_pred = y_pred_buffer[batch_i+b, frame_i].sum(0)
-                    y_pred /= (sample_count+1)
-                else:
-                    # General case
-                    y_pred = (y_pred_buffer[batch_i+b, frame_i] * weight[:, None, None]).sum(0)
-                    
-                ensemble_i = torch.cat((ensemble_i, i[b][0].reshape(1, 1, 2)), dim=0)
-                ensemble_y = torch.cat((ensemble_y, y[b][0].reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                sample_count += 1
-
-                if sample_count == num_sample:
-                    # Last batch
-                    y_zero_pad = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
-                    y_pred_buffer = torch.cat((y_pred_buffer, y_zero_pad), dim=0)
+    timer = timer if timer is not None else StageTimer()
+    tracknet_pred_dict = test_rally(
+        (tracknet, None), rally_dir,
+        dict(param_dict, output_gt=True, output_bbox=False, output_provenance=False),
+        save_inpaint_mask=True, timer=timer, run_info=run_info)
     
-                    for f in range(1, seq_len):
-                        # Last input sequence
-                        y_pred = y_pred_buffer[batch_i+b+f, frame_i].sum(0)
-                        y_pred /= (seq_len-f)
-                        ensemble_i = torch.cat((ensemble_i, i[-1][f].reshape(1, 1, 2)), dim=0)
-                        ensemble_y = torch.cat((ensemble_y, y[-1][f].reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                        ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                    
-            # Predict
-            tmp_pred = evaluate(ensemble_i, y_true=ensemble_y, y_pred=ensemble_y_pred, tolerance=param_dict['tolerance'])
-            for key in tmp_pred.keys():
-                tracknet_pred_dict[key].extend(tmp_pred[key])
-
-            # Update buffer, keep last predictions for ensemble in next iteration
-            y_pred_buffer = y_pred_buffer[-buffer_size:]
-    
-    tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(tracknet_pred_dict, th_h=30)
+    context_len = param_dict.get('inpaintnet_seq_len', param_dict['tracknet_seq_len'])
+    tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(
+        tracknet_pred_dict, th_h=30, seq_len=context_len)
 
     
-    file_format_str = os.path.join('{}', 'frame', '{}')
-    match_dir, rally_id = parse.parse(file_format_str, rally_dir)
-    csv_file = os.path.join(match_dir, 'corrected_csv',f'{rally_id}_ball.csv')
-    label_df = pd.read_csv(csv_file, encoding='utf-8')
-    x_gt, y_gt = label_df['X'].values / w, label_df['Y'].values / h
-
-    # Linear inpainting
-    x_pred = linear_interp(tracknet_pred_dict['X'], tracknet_pred_dict['Inpaint_Mask']) / WIDTH
-    y_pred = linear_interp(tracknet_pred_dict['Y'], tracknet_pred_dict['Inpaint_Mask']) / HEIGHT
-
-    d_i = torch.empty((0, 1, 2), dtype=torch.float32)
-    coor = torch.empty((0, 1, 2), dtype=torch.float32)
-    coor_inpaint = torch.empty((0, 1, 2), dtype=torch.float32)
-
-    for i in range(len(label_df)):
-        d_i = torch.cat((d_i, torch.tensor([[[0, i]]], dtype=torch.float32)), dim=0)
-        coor = torch.cat((coor, torch.tensor([[[x_gt[i], y_gt[i]]]], dtype=torch.float32)), dim=0)
-        coor_inpaint = torch.cat((coor_inpaint, torch.tensor([[[x_pred[i], y_pred[i]]]], dtype=torch.float32)), dim=0)
+    with timer.measure('postprocess'):
+        mask = tracknet_pred_dict['Inpaint_Mask']
+        coordinates = np.column_stack((linear_interp(tracknet_pred_dict['X'], mask) / WIDTH,
+                                       linear_interp(tracknet_pred_dict['Y'], mask) / HEIGHT))
+        truth = np.column_stack((np.asarray(tracknet_pred_dict['X_GT']) / WIDTH,
+                                 np.asarray(tracknet_pred_dict['Y_GT']) / HEIGHT))
+        indices = np.column_stack((np.zeros(len(coordinates), dtype=np.int64),
+                                   np.asarray(tracknet_pred_dict['Frame'], dtype=np.int64)))
+        inpaintnet_pred_dict = evaluate(indices[:, None, :], c_true=truth[:, None, :],
+                                        c_pred=coordinates[:, None, :], tolerance=param_dict['tolerance'],
+                                        img_scaler=(w_scaler, h_scaler))
+    raw_pred = {key: list(tracknet_pred_dict[key]) for key in ('Frame', 'X', 'Y', 'Visibility')}
+    raw_pred['X'] = [int(x * w_scaler) for x in raw_pred['X']]
+    raw_pred['Y'] = [int(y * h_scaler) for y in raw_pred['Y']]
+    inpaintnet_pred_dict.update(format_inpaint_predictions(
+        raw_pred, coordinates,
+        np.asarray(tracknet_pred_dict['Inpaint_Mask']).reshape(-1, 1), (w, h)))
     
-    inpaintnet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[]}
-    tmp_pred = evaluate(d_i, c_true=coor, c_pred=coor_inpaint, tolerance=param_dict['tolerance'], img_scaler=(w_scaler, h_scaler))
-    for key in tmp_pred.keys():
-        inpaintnet_pred_dict[key].extend(tmp_pred[key])
-    
+    if run_info is not None:
+        inpaintnet_pred_dict['Type_Raw'] = tracknet_pred_dict['Type']
+        run_info['repair_method'] = 'bounded_linear_interpolation'
     return inpaintnet_pred_dict
 
 if __name__ == '__main__':
@@ -912,15 +797,30 @@ if __name__ == '__main__':
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'], help='dataset split for testing')
     parser.add_argument('--batch_size', type=int, default=16, help='batch size for testing')
     parser.add_argument('--tolerance', type=float, default=4, help='difference tolerance of center distance between prediction and ground truth in input size')
+    parser.add_argument('--heatmap_threshold', type=validate_heatmap_threshold, default=0.5,
+                        help='strict heatmap > threshold in [0,1] for fresh heatmaps; cached coordinates are unchanged')
     parser.add_argument('--eval_mode', type=str, default='weight', choices=['nonoverlap', 'average', 'weight'], help='evaluation mode')
     parser.add_argument('--video_file', type=str, default='', help='file path of the video with label (must in dataset directory with same data_dir)')
     parser.add_argument('--output_pred', action='store_true', default=False, help='whether to output detail prediction result for error analysis')
+    parser.add_argument('--output_provenance', action='store_true', default=False,
+                        help='append raw detection columns and eligible Inpaint_Mask to video-evaluation CSV output; include --output_pred for dataset details')
+    parser.add_argument('--output_run', action='store_true',
+                        help='write reproducible raw/final metrics, checkpoint identities, protocol, and synchronized stage timing')
     parser.add_argument('--output_bbox', action='store_true', default=False, help='whether to output coco format bbox prediction result for mAP evaluation')
     parser.add_argument('--save_dir', type=str, default='output', help='directory to save the evaluation result')
     parser.add_argument('--verbose', action='store_true', default=False)
     parser.add_argument('--debug', action='store_true', default=False)
-    parser.add_argument('--linear_interp', action='store_true', default=False)
+    parser.add_argument('--linear_interp', action='store_true', default=False,
+                        help='evaluate bounded linear repair; maximum gap is context length minus two (InpaintNet length, or TrackNet length without InpaintNet)')
     args = parser.parse_args()
+    if not args.tracknet_file and not args.inpaintnet_file:
+        parser.error('provide --tracknet_file or --inpaintnet_file')
+    if args.linear_interp and not args.tracknet_file:
+        parser.error('--linear_interp requires --tracknet_file')
+    evaluation_protocol(args.tolerance)
+    timer = StageTimer(args.output_run)
+    run_results = [] if args.output_run else None
+    run_models = {}
 
     param_dict = vars(args)
     param_dict['num_workers'] = args.batch_size if args.batch_size <= 16 else 16
@@ -933,21 +833,33 @@ if __name__ == '__main__':
     # Load parameter
     print(f'Loading checkpoint...')
     if args.tracknet_file:
-        tracknet_ckpt = torch.load(args.tracknet_file)
-        param_dict['tracknet_seq_len'] = tracknet_ckpt['param_dict']['seq_len']
-        param_dict['bg_mode'] = tracknet_ckpt['param_dict']['bg_mode']
-        tracknet = get_model('TrackNet', seq_len=param_dict['tracknet_seq_len'], bg_mode=param_dict['bg_mode']).cuda()
-        tracknet.load_state_dict(tracknet_ckpt['model'])
+        with timer.measure('model_load'):
+            tracknet_ckpt, identity = load_checkpoint(args.tracknet_file, args.output_run, timer=timer)
+            if args.output_run:
+                run_models['TrackNet'] = identity
+            param_dict['tracknet_seq_len'] = tracknet_ckpt['param_dict']['seq_len']
+            param_dict['bg_mode'] = tracknet_ckpt['param_dict']['bg_mode']
+            tracknet = get_model('TrackNet', seq_len=param_dict['tracknet_seq_len'], bg_mode=param_dict['bg_mode']).cuda()
+            tracknet.load_state_dict(tracknet_ckpt['model'])
+            if timer.enabled:
+                timer.synchronize(model_device(tracknet))
         model = (tracknet, None)
     else:
         tracknet = None
     
     if args.inpaintnet_file:
-        inpaintnet_ckpt = torch.load(args.inpaintnet_file)
-        param_dict['inpaintnet_seq_len'] = inpaintnet_ckpt['param_dict']['seq_len']
-        inpaintnet = get_model('InpaintNet').cuda()
-        inpaintnet.load_state_dict(inpaintnet_ckpt['model'])
+        with timer.measure('model_load'):
+            inpaintnet_ckpt, identity = load_checkpoint(args.inpaintnet_file, args.output_run, timer=timer)
+            if args.output_run:
+                run_models['InpaintNet'] = identity
+            param_dict['inpaintnet_seq_len'] = inpaintnet_ckpt['param_dict']['seq_len']
+            inpaintnet = get_model('InpaintNet').cuda()
+            inpaintnet.load_state_dict(inpaintnet_ckpt['model'])
+            if timer.enabled:
+                timer.synchronize(model_device(inpaintnet))
         model = (tracknet, inpaintnet)
+        if tracknet is None:
+            print('Using cached TrackNet coordinates; the requested heatmap threshold is not applied to cached coordinates.')
 
     if args.video_file:
         # Evaluation on video
@@ -962,14 +874,23 @@ if __name__ == '__main__':
         label_df = pd.read_csv(csv_file, encoding='utf8').sort_values(by='Frame').fillna(0)
 
         # Predict label
-        pred_dict = test_rally(model, rally_dir, param_dict)
+        run_info = {} if args.output_run else None
+        evaluate_rally = test_rally_linear if args.linear_interp else test_rally
+        pred_dict = evaluate_rally(model, rally_dir, param_dict, timer=timer, run_info=run_info)
 
         # Write results
         out_video_file = os.path.join(args.save_dir, f'{rally_id}.mp4')
         out_csv_file = os.path.join(args.save_dir, f'{rally_id}_ball.csv')
-        frame_list, fps, (w, h) = generate_frames(args.video_file)
-        write_pred_video(frame_list, dict(fps=fps, shape=(w, h)), pred_dict, label_df=label_df, save_file=out_video_file)
-        write_pred_csv(pred_dict, save_file=out_csv_file)
+        with timer.measure('output_video'):
+            write_pred_video(args.video_file, pred_dict, label_df=label_df, save_file=out_video_file)
+        with timer.measure('output_csv'):
+            write_pred_csv(pred_dict, save_file=out_csv_file, save_provenance=args.output_provenance)
+        if args.output_run:
+            with timer.measure('metrics'):
+                result = rally_run_result(pred_dict, run_info, param_dict, rally_id)
+            result['timing'] = timer.result(len(pred_dict['Frame']), includes_checkpoint_loading=True)
+            run_results.append(result)
+            report_file = os.path.join(args.save_dir, f'{rally_id}_run.json')
     else:
         # Evaluation on dataset
         eval_analysis_file = os.path.join(args.save_dir, f'{args.split}_eval_analysis_{args.eval_mode}.json') # for error analysis interface
@@ -980,22 +901,26 @@ if __name__ == '__main__':
         print(f'Evaluation mode: {args.eval_mode}')
         print(f'Tolerance Value: {args.tolerance}')
         
-        pred_dict = test(model, args.split, param_dict, linear_interp=args.linear_interp)
+        pred_dict = test(model, args.split, param_dict, linear_interp=args.linear_interp,
+                         timer=timer, run_results=run_results, run_models=run_models)
         if args.split == 'test':
             # Drop samples which is not in the effective trajectory
             res_dict = get_test_res(pred_dict, drop=True)
         else:
             res_dict = get_test_res(pred_dict, drop=False)
         
-        with open(eval_res_file, 'w') as f:
+        with timer.measure('output_metrics'), open(eval_res_file, 'w') as f:
             json.dump(res_dict, f, indent=2)
 
         if args.output_pred:
             eval_dict = dict(param_dict=param_dict, pred_dict=pred_dict)
-            with open(eval_analysis_file, 'w') as f:
+            with timer.measure('output_predictions'), open(eval_analysis_file, 'w') as f:
                 json.dump(eval_dict, f, indent=2)
 
         if args.output_bbox:
+            from pycocotools.coco import COCO
+            from pycocotools.cocoeval import COCOeval
+
             coco_file = os.path.join(args.save_dir, f'{args.split}_coco_res_{args.eval_mode}.json')
             if args.split == 'test':
                 dect_list = get_coco_res(pred_dict, drop=True)
@@ -1016,3 +941,16 @@ if __name__ == '__main__':
             coco_res_dict = dict(AP_25=mAP, detection=dect_list)
             with open(coco_file, 'w') as f:
                 json.dump(coco_res_dict, f, indent=2)
+        if args.output_run:
+            report_file = os.path.join(args.save_dir, f'{args.split}_run_{args.eval_mode}.json')
+    if args.output_run:
+        frame_filter = (file_identity(os.path.join(data_dir, 'drop_frame.json'))
+                        if not args.video_file and args.split == 'test' else None)
+        original_frames = sum(result['statistics']['final']['frames'] for result in run_results)
+        settings = dict(param_dict, data_dir=data_dir, input_size=[WIDTH, HEIGHT],
+                        coordinate_suppression_threshold=COOR_TH,
+                        repair_policy='same_window_raw_endpoints_v1')
+        write_run_report(report_file, settings, run_models, run_results,
+                         timer.result(original_frames, includes_checkpoint_loading=True),
+                         model_device(model[0] if model[0] is not None else model[1]),
+                         evaluation_protocol(args.tolerance, frame_filter))

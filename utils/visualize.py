@@ -7,6 +7,7 @@ from PIL import Image
 
 from dataset import data_dir
 from utils.general import *
+from utils.metric import validate_heatmap_threshold
 
 def write_to_tb(model_type, tb_writer, losses, val_res, epoch):
     """ Write training and validation results to tensorboard. 
@@ -100,7 +101,7 @@ def plot_median_files(data_dir):
                     median = np.load(os.path.join(rally_dir, 'median.npz'))['median'][..., ::-1] # BGR to RGB
                     cv2.imwrite(os.path.join(data_dir, 'median', f'{split}_m{match_id}_r{rally_id}.{IMG_FORMAT}'), median)
 
-def plot_heatmap_pred_sample(x, y, y_pred, c, bg_mode, save_dir):
+def plot_heatmap_pred_sample(x, y, y_pred, c, bg_mode, save_dir, heatmap_threshold=0.5):
     """ Visualize input and output of TrackNet and save as a gif. Including 4 subplots:
             Top left: Frames sequence with ball coordinate marked
             Top right: Ground-truth heatmap sequence
@@ -122,7 +123,7 @@ def plot_heatmap_pred_sample(x, y, y_pred, c, bg_mode, save_dir):
     imgs = []
 
     # Thresholding
-    y_map = y_pred > 0.5
+    y_map = y_pred > validate_heatmap_threshold(heatmap_threshold)
 
     # Convert input and output to image format
     x = to_img(x)

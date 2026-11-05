@@ -1,4 +1,31 @@
+import math
+import numpy as np
 import torch
+
+
+PRED_TYPES = ['TP', 'TN', 'FP1', 'FP2', 'FN']
+
+
+def validate_heatmap_threshold(value):
+    value = float(value)
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError('Heatmap threshold must be finite and between 0 and 1')
+    return value
+
+
+def metrics_from_types(types):
+    types = np.asarray(types)
+    if types.ndim != 1 or not np.isin(types, np.arange(len(PRED_TYPES))).all():
+        raise ValueError('Prediction types must be a one-dimensional sequence of TP/TN/FP1/FP2/FN indices')
+    counts = {name: int((types == index).sum()) for index, name in enumerate(PRED_TYPES)}
+    return metrics_from_counts(counts)
+
+
+def metrics_from_counts(counts):
+    if any(not math.isfinite(counts[key]) or counts[key] < 0 or int(counts[key]) != counts[key] for key in PRED_TYPES):
+        raise ValueError('Confusion counts must be finite nonnegative integers')
+    accuracy, precision, recall, f1, miss_rate = get_metric(*(counts[key] for key in PRED_TYPES))
+    return dict(counts, accuracy=accuracy, precision=precision, recall=recall, f1=f1, miss_rate=miss_rate)
 
 def WBCELoss(y_pred, y, reduce=True):
     """ Weighted Binary Cross Entropy loss function defined in TrackNetV2 paper.
@@ -44,4 +71,3 @@ def get_metric(TP, TN, FP1, FP2, FN):
     miss_rate = FN / (TP + FN) if (TP + FN) > 0 else 0
     
     return accuracy, precision, recall, f1, miss_rate
-

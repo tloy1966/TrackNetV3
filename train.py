@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset import Shuttlecock_Trajectory_Dataset
 from test import eval_tracknet, eval_inpaintnet
 from utils.general import ResumeArgumentParser, get_model, to_img_format
-from utils.metric import WBCELoss
+from utils.metric import WBCELoss, validate_heatmap_threshold
 from utils.visualize import plot_heatmap_pred_sample, plot_traj_pred_sample, write_to_tb
 
 
@@ -116,7 +116,9 @@ def train_tracknet(model, optimizer, data_loader, param_dict):
                 x = to_img_format(x, num_ch=3)
             y = to_img_format(y)
             y_pred = to_img_format(y_pred)
-            plot_heatmap_pred_sample(x[0], y[0], y_pred[0], c[0], bg_mode=param_dict['bg_mode'], save_dir=param_dict['save_dir'])
+            plot_heatmap_pred_sample(x[0], y[0], y_pred[0], c[0], bg_mode=param_dict['bg_mode'],
+                                     save_dir=param_dict['save_dir'],
+                                     heatmap_threshold=param_dict.get('heatmap_threshold', 0.5))
     
     return float(np.mean(epoch_loss))
    
@@ -191,6 +193,8 @@ if __name__ == '__main__':
     parser.add_argument('--frame_alpha', type=float, default=-1, help='alpha of frame mixup, -1 means no mixup')
     parser.add_argument('--mask_ratio', type=float, default=0.3, help='ratio of random mask during training InpaintNet')
     parser.add_argument('--tolerance', type=float, default=4, help='difference tolerance of center distance between prediction and ground truth in input size')
+    parser.add_argument('--heatmap_threshold', type=validate_heatmap_threshold, default=0.5,
+                        help='heatmap decoding threshold for evaluation and visualizations, not the training loss')
     parser.add_argument('--resume_training', action='store_true', default=False, help='resume training from experiment directory')
     parser.add_argument('--seed', type=int, default=13, help='random seed')
     parser.add_argument('--save_dir', type=str, default='exp', help='directory to save the checkpoints and prediction result')
@@ -222,6 +226,7 @@ if __name__ == '__main__':
         ckpt['param_dict']['resume_training'] = args.resume_training
         ckpt['param_dict']['epochs'] = args.epochs
         ckpt['param_dict']['verbose'] = args.verbose
+        ckpt['param_dict']['heatmap_threshold'] = args.heatmap_threshold
         args = ResumeArgumentParser(ckpt['param_dict'])
 
     print(f'Parameters: {param_dict}')
